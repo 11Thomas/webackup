@@ -1,0 +1,121 @@
+name: Build WeBackup .fpk
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '镜像与 .fpk 版本标签 (如 0.1.0)'
+        required: true
+        default: '0.1.0'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set version and lowercase owner
+        id: ver
+        run: |
+          echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          OWNER_LOWER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "owner_lower=$OWNER_LOWER" >> "$GITHUB_OUTPUT"
+          echo "仓库属主（小写）: $OWNER_LOWER"
+
+      - name: Unzip source (兼容 zip 根目录带/不带 webackup/ 前缀)
+        run: |
+          set -e
+          echo "当前目录内容:"
+          ls -la
+          if [ ! -f webackup-pack.zip ]; then
+            echo "错误：找不到 webackup-pack.zip，请把它上传到仓库根目录。"
+            exit 1
+          fi
+          unzip -o webackup-pack.zip
+          echo "解压后根目录内容:"
+          ls -la
+          if [ ! -d webackup ]; then
+            echo "检测到 zip 内没有 webackup/ 目录，自动整理..."
+            mkdir -p webackup-tmp
+            find . -maxdepth 1 -mindepth 1 ! -name 'webackup-pack.zip' ! -name 'webackup-tmp' -exec mv {} webackup-tmp/ \;
+            mv webackup-tmp webackup
+          fi
+          echo "最终 webackup/ 目录内容:"
+          ls -la webackup
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image (强制 linux/amd64，fnOS 仅 x86_64)
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -e
+          IMAGE="ghcr.io/${{ steps.ver.outputs.owner_lower }}/webackup:${TAG}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "开始构建镜像: $IMAGE"
+          docker build --platform linux/amd64 -t "$IMAGE" -f webackup/Dockerfile webackup
+          echo "推送镜像..."
+          docker push "$IMAGE"
+          echo "镜像推送完成: $IMAGE"
+
+      - name: Make GHCR package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PATCH "user/packages/container/webackup/visibility" -f visibility=public \
+            || echo "⚠️ 请手动到 GitHub Packages 页面把 webackup 设为 Public"
+
+      - name: Download fnpack CLI
+        env:
+          FNPACK_DOWNLOAD_URL: ${{ secrets.FNPACK_DOWNLOAD_URL || 'https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64' }}
+        run: |
+          echo "下载 fnpack: $FNPACK_DOWNLOAD_URL"
+          curl -sSL -o fnpack "$FNPACK_DOWNLOAD_URL"
+          chmod +x fnpack
+          ./fnpack --version || true
+
+      - name: Prepare package and replace image placeholder
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          IMAGE: ${{ env.IMAGE }}
+        run: |
+          set -e
+          BUILD_DIR="$(mktemp -d)"
+          cp -r webackup/deploy/fnos/. "$BUILD_DIR/"
+          node -e "const fs=require('fs');const p='$BUILD_DIR/app/docker/docker-compose.yaml';let s=fs.readFileSync(p,'utf8');s=s.split('__WEBACKUP_IMAGE__').join('$IMAGE');fs.writeFileSync(p,s);"
+          chmod +x "$BUILD_DIR/cmd/"*
+          echo "打包目录内容:"
+          ls -la "$BUILD_DIR"
+          echo "BUILD_DIR=$BUILD_DIR" >> "$GITHUB_ENV"
+
+      - name: fnpack build
+        run: |
+          set -e
+          echo "进入打包目录: $BUILD_DIR"
+          ( cd "$BUILD_DIR" && "$GITHUB_WORKSPACE/fnpack" build )
+          echo "打包完成，查看产物:"
+          ls -la "$BUILD_DIR"
+
+      - name: Upload .fpk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webackup-fpk
+          path: ${{ env.BUILD_DIR }}/*.fpk
